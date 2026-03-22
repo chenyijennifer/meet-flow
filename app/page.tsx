@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -14,7 +14,23 @@ import {
 } from "@/components/ui/dialog";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Input } from "@/components/ui/input";
-import { Plus, Users, Calendar, User, CalendarCheck } from "lucide-react";
+import {
+  Plus,
+  Users,
+  Calendar,
+  User,
+  CalendarCheck,
+  CalendarPlus,
+} from "lucide-react";
+import {
+  type AttendeeSlotGap,
+  type Meeting,
+  findAttendeesMissingSlots,
+  formatMeetingTime,
+  formatSlotLabel,
+  meetingsBlockingSlotForMember,
+  slotsForMeeting,
+} from "@/lib/meetingConflicts";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -82,6 +98,49 @@ const INITIAL_MEMBERS: Member[] = [
   },
 ];
 
+// 已排會議假資料（須與 INITIAL_MEMBERS 空閒一致；載入時會從與會者空閒扣格）
+const INITIAL_MEETINGS: Meeting[] = [
+  {
+    id: "meeting-seed-sync",
+    title: "產品同步",
+    day: 2,
+    startHour: 9,
+    endHour: 11,
+    attendeeIds: ["me", "xiao-liang"],
+  },
+];
+
+function applyMeetingsToMembers(
+  members: Member[],
+  meetings: Meeting[]
+): Member[] {
+  return members.map((m) => {
+    let availability = [...m.availability];
+    for (const meet of meetings) {
+      if (!meet.attendeeIds.includes(m.id)) continue;
+      const slots = slotsForMeeting(
+        meet.day,
+        meet.startHour,
+        meet.endHour
+      );
+      availability = availability.filter((s) => !slots.includes(s));
+    }
+    return { ...m, availability };
+  });
+}
+
+function endHourOptions(startHour: number): number[] {
+  const out: number[] = [];
+  for (let h = startHour + 1; h <= 18; h++) out.push(h);
+  return out;
+}
+
+function attendeeNames(ids: string[], members: Member[]): string {
+  return ids
+    .map((id) => members.find((m) => m.id === id)?.name ?? id)
+    .join("、");
+}
+
 // ─── Schedule Grid Component ──────────────────────────────────────────────────
 
 type DragState = {
@@ -96,10 +155,13 @@ function ScheduleGrid({
   availability,
   onBatchToggle,
   emerald = false,
+  lockedSlotKeys,
 }: {
   availability: TimeSlot[];
   onBatchToggle?: (slots: TimeSlot[], fill: boolean) => void;
   emerald?: boolean;
+  /** 有會議占用且目前為忙碌：無法點回空閒（僅「我的時間表」使用） */
+  lockedSlotKeys?: Set<string>;
 }) {
   const [drag, setDrag] = useState<DragState | null>(null);
   const dragging = useRef(false);
@@ -155,6 +217,7 @@ function ScheduleGrid({
               {DAYS.map((_, d) => {
                 const s = slot(d, h);
                 const active = availability.includes(s);
+                const locked = Boolean(lockedSlotKeys?.has(s) && !active);
                 const inRect = inDragRect(d, hi);
 
                 let cellClass: string;
@@ -167,16 +230,31 @@ function ScheduleGrid({
                   cellClass = emerald
                     ? "bg-emerald-400 border-emerald-400"
                     : "bg-primary border-primary";
+                } else if (locked) {
+                  cellClass =
+                    "bg-muted border-border ring-1 ring-amber-500/45 dark:ring-amber-400/40";
                 } else {
                   cellClass = "bg-muted border-border hover:bg-muted/60";
                 }
 
+                const cursorClass = !onBatchToggle
+                  ? "cursor-default"
+                  : locked
+                    ? "cursor-not-allowed"
+                    : "cursor-pointer";
+
                 return (
                   <td key={d} className="p-0.5">
                     <div
-                      className={`h-8 rounded border transition-colors ${cellClass} ${onBatchToggle ? "cursor-pointer" : "cursor-default"}`}
+                      title={
+                        locked
+                          ? "此時段已排入會議，無法改為空閒"
+                          : undefined
+                      }
+                      className={`h-8 rounded border transition-colors ${cellClass} ${cursorClass}`}
                       onMouseDown={(e) => {
                         if (!onBatchToggle) return;
+                        if (locked) return;
                         e.preventDefault();
                         dragging.current = true;
                         setDrag({
@@ -223,10 +301,36 @@ function Legend({ items }: { items: { color: string; label: string }[] }) {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function MeetFlow() {
-  const [members, setMembers] = useState<Member[]>(INITIAL_MEMBERS);
+  const [meetings, setMeetings] = useState<Meeting[]>(
+    () => INITIAL_MEETINGS.map((m) => ({ ...m }))
+  );
+  const [members, setMembers] = useState<Member[]>(() =>
+    applyMeetingsToMembers(INITIAL_MEMBERS, INITIAL_MEETINGS)
+  );
   const [newName, setNewName] = useState("");
   const [open, setOpen] = useState(false);
   const [viewId, setViewId] = useState("xiao-liang");
+
+  const [meetingTitle, setMeetingTitle] = useState("");
+  const [meetingDay, setMeetingDay] = useState(2);
+  const [meetingStart, setMeetingStart] = useState(9);
+  const [meetingEnd, setMeetingEnd] = useState(11);
+  const [selectedAttendeeIds, setSelectedAttendeeIds] = useState<string[]>([
+    "me",
+  ]);
+
+  const [availabilityDialogOpen, setAvailabilityDialogOpen] = useState(false);
+  const [availabilityGaps, setAvailabilityGaps] = useState<AttendeeSlotGap[]>(
+    []
+  );
+  const [scheduleBlockedDialogOpen, setScheduleBlockedDialogOpen] =
+    useState(false);
+  const [scheduleBlockingMeetings, setScheduleBlockingMeetings] = useState<
+    Meeting[]
+  >([]);
+  const [meetingSuccessNotice, setMeetingSuccessNotice] = useState<
+    string | null
+  >(null);
 
   const me = members.find((m) => m.id === "me")!;
   const others = members.filter((m) => m.id !== "me");
@@ -238,7 +342,47 @@ export default function MeetFlow() {
     ).map((h) => slot(d, h))
   );
 
+  const myMeetingLockedSlots = useMemo(() => {
+    const out = new Set<string>();
+    for (const m of meetings) {
+      if (!m.attendeeIds.includes("me")) continue;
+      for (const sk of slotsForMeeting(
+        m.day,
+        m.startHour,
+        m.endHour
+      )) {
+        if (!me.availability.includes(sk)) out.add(sk);
+      }
+    }
+    return out;
+  }, [meetings, me.availability]);
+
+  useEffect(() => {
+    if (!meetingSuccessNotice) return;
+    const t = setTimeout(() => setMeetingSuccessNotice(null), 4500);
+    return () => clearTimeout(t);
+  }, [meetingSuccessNotice]);
+
   function batchToggleMySlots(slots: TimeSlot[], fill: boolean) {
+    if (fill) {
+      const lockedSelected = slots.filter((s) => myMeetingLockedSlots.has(s));
+      if (lockedSelected.length > 0) {
+        const blockingMap = new Map<string, Meeting>();
+        for (const sk of lockedSelected) {
+          for (const bm of meetingsBlockingSlotForMember(
+            meetings,
+            "me",
+            sk
+          )) {
+            blockingMap.set(bm.id, bm);
+          }
+        }
+        setScheduleBlockingMeetings([...blockingMap.values()]);
+        setScheduleBlockedDialogOpen(true);
+        return;
+      }
+    }
+
     setMembers((prev) =>
       prev.map((m) =>
         m.id !== "me"
@@ -266,6 +410,65 @@ export default function MeetFlow() {
     setMembers((prev) => [...prev, newMember]);
     setNewName("");
     setOpen(false);
+  }
+
+  function toggleMeetingAttendee(id: string) {
+    setSelectedAttendeeIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  }
+
+  function onMeetingStartChange(next: number) {
+    setMeetingStart(next);
+    setMeetingEnd((end) => {
+      const opts = endHourOptions(next);
+      if (opts.includes(end) && end > next) return end;
+      return opts[0] ?? next + 1;
+    });
+  }
+
+  const meetingEndChoices = endHourOptions(meetingStart);
+  const meetingFormValid =
+    selectedAttendeeIds.length > 0 &&
+    meetingStart < meetingEnd &&
+    meetingEndChoices.includes(meetingEnd);
+
+  function submitNewMeeting() {
+    if (!meetingFormValid) return;
+    const slots = slotsForMeeting(meetingDay, meetingStart, meetingEnd);
+    const gaps = findAttendeesMissingSlots(
+      members,
+      selectedAttendeeIds,
+      slots
+    );
+    if (gaps.length > 0) {
+      setAvailabilityGaps(gaps);
+      setAvailabilityDialogOpen(true);
+      return;
+    }
+    const newMeeting: Meeting = {
+      id: `meeting-${Date.now()}`,
+      title: meetingTitle.trim() || undefined,
+      day: meetingDay,
+      startHour: meetingStart,
+      endHour: meetingEnd,
+      attendeeIds: selectedAttendeeIds,
+    };
+    setMeetings((prev) => [...prev, newMeeting]);
+    setMembers((prev) =>
+      prev.map((m) => {
+        if (!selectedAttendeeIds.includes(m.id)) return m;
+        return {
+          ...m,
+          availability: m.availability.filter((s) => !slots.includes(s)),
+        };
+      })
+    );
+    setMeetingSuccessNotice(
+      `已建立會議：${formatMeetingTime(newMeeting, DAYS)}${
+        newMeeting.title ? `（${newMeeting.title}）` : ""
+      }`
+    );
   }
 
   return (
@@ -296,6 +499,10 @@ export default function MeetFlow() {
             <TabsTrigger value="view-member" className="gap-1.5 text-sm">
               <Calendar className="w-3.5 h-3.5" />
               查看成員
+            </TabsTrigger>
+            <TabsTrigger value="create-meeting" className="gap-1.5 text-sm">
+              <CalendarPlus className="w-3.5 h-3.5" />
+              建立會議
             </TabsTrigger>
             <TabsTrigger value="common" className="gap-1.5 text-sm">
               <CalendarCheck className="w-3.5 h-3.5" />
@@ -381,11 +588,17 @@ export default function MeetFlow() {
                   items={[
                     { color: "bg-primary", label: "空閒" },
                     { color: "bg-muted border border-border", label: "忙碌" },
+                    {
+                      color:
+                        "bg-muted ring-1 ring-amber-500/45 dark:ring-amber-400/40",
+                      label: "會議占用（無法改回空閒）",
+                    },
                   ]}
                 />
                 <ScheduleGrid
                   availability={me.availability}
                   onBatchToggle={batchToggleMySlots}
+                  lockedSlotKeys={myMeetingLockedSlots}
                 />
               </CardContent>
             </Card>
@@ -451,6 +664,157 @@ export default function MeetFlow() {
             )}
           </TabsContent>
 
+          {/* ── Tab: Create meeting（空閒同步） ── */}
+          <TabsContent value="create-meeting">
+            <div className="mb-5">
+              <h2 className="text-base font-semibold">建立會議</h2>
+              <p className="text-sm text-muted-foreground mt-0.5">
+                單日連續時段：僅當每位與會者在所選時段皆為空閒時可建立；建立後該時段會從其空閒中移除（改為忙碌）
+              </p>
+            </div>
+
+            <Card className="mb-6">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base font-semibold">
+                  新會議
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <label htmlFor="meeting-title" className="text-sm font-medium">
+                    標題（選填）
+                  </label>
+                  <Input
+                    id="meeting-title"
+                    placeholder="例如：專案檢討"
+                    value={meetingTitle}
+                    onChange={(e) => setMeetingTitle(e.target.value)}
+                  />
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-3">
+                  <div className="space-y-2">
+                    <span className="text-sm font-medium">星期</span>
+                    <select
+                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
+                      value={meetingDay}
+                      onChange={(e) =>
+                        setMeetingDay(Number(e.target.value))
+                      }
+                    >
+                      {DAYS.map((d, i) => (
+                        <option key={d} value={i}>
+                          {d}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-sm font-medium">開始小時</span>
+                    <select
+                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
+                      value={meetingStart}
+                      onChange={(e) =>
+                        onMeetingStartChange(Number(e.target.value))
+                      }
+                    >
+                      {HOURS.map((h) => (
+                        <option key={h} value={h}>
+                          {h}:00
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-2">
+                    <span className="text-sm font-medium">結束小時</span>
+                    <select
+                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
+                      value={meetingEnd}
+                      onChange={(e) =>
+                        setMeetingEnd(Number(e.target.value))
+                      }
+                    >
+                      {meetingEndChoices.map((h) => (
+                        <option key={h} value={h}>
+                          {h}:00
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground -mt-2">
+                  時間為半開區間：含開始、不含結束（與網格「h:00–h+1:00」一致）
+                </p>
+
+                <div className="space-y-2">
+                  <span className="text-sm font-medium">與會者</span>
+                  <p className="text-xs text-muted-foreground">
+                    至少選擇一位；任一人若在所選時段有任何一格非空閒，將無法建立
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {members.map((m) => {
+                      const on = selectedAttendeeIds.includes(m.id);
+                      return (
+                        <Button
+                          key={m.id}
+                          type="button"
+                          variant={on ? "default" : "outline"}
+                          size="sm"
+                          onClick={() => toggleMeetingAttendee(m.id)}
+                        >
+                          {m.name}
+                        </Button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <Button
+                  type="button"
+                  onClick={submitNewMeeting}
+                  disabled={!meetingFormValid}
+                >
+                  建立會議
+                </Button>
+                {meetingSuccessNotice ? (
+                  <p
+                    role="status"
+                    className="text-sm rounded-md border border-emerald-200 bg-emerald-50 text-emerald-900 px-3 py-2 dark:border-emerald-800 dark:bg-emerald-950 dark:text-emerald-100"
+                  >
+                    {meetingSuccessNotice}
+                  </p>
+                ) : null}
+              </CardContent>
+            </Card>
+
+            <div>
+              <h3 className="text-sm font-semibold mb-3">已排會議</h3>
+              {meetings.length === 0 ? (
+                <p className="text-sm text-muted-foreground">尚無會議</p>
+              ) : (
+                <ul className="space-y-2">
+                  {meetings.map((m) => (
+                    <li key={m.id}>
+                      <Card>
+                        <CardContent className="p-4 text-sm">
+                          <p className="font-medium">
+                            {m.title ?? "（無標題）"}
+                          </p>
+                          <p className="text-muted-foreground mt-1">
+                            {formatMeetingTime(m, DAYS)}
+                          </p>
+                          <p className="text-muted-foreground mt-1">
+                            與會：{attendeeNames(m.attendeeIds, members)}
+                          </p>
+                        </CardContent>
+                      </Card>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </TabsContent>
+
           {/* ── Tab 4: Common Availability ── */}
           <TabsContent value="common">
             <div className="mb-5">
@@ -496,6 +860,60 @@ export default function MeetFlow() {
           </TabsContent>
         </Tabs>
       </main>
+
+      <Dialog
+        open={scheduleBlockedDialogOpen}
+        onOpenChange={setScheduleBlockedDialogOpen}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>無法標示為空閒</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            以下會議已占用此時段，無法將該格改回空閒。
+          </p>
+          <ul className="list-disc pl-5 space-y-2 text-sm">
+            {scheduleBlockingMeetings.map((m) => (
+              <li key={m.id}>
+                <span className="font-medium text-foreground">
+                  {formatMeetingTime(m, DAYS)}
+                </span>
+                {m.title ? (
+                  <span className="text-muted-foreground"> — {m.title}</span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={availabilityDialogOpen}
+        onOpenChange={setAvailabilityDialogOpen}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>所選時段非全員空閒</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            以下成員在部分所選時段沒有空閒，請調整時段或與會者後再建立。
+          </p>
+          <ul className="space-y-3 text-sm">
+            {availabilityGaps.map((g) => (
+              <li key={g.memberId}>
+                <span className="font-medium text-foreground">
+                  {g.memberName}
+                </span>
+                <ul className="mt-1 list-disc pl-5 text-muted-foreground text-xs space-y-0.5">
+                  {g.missingSlots.map((s) => (
+                    <li key={s}>{formatSlotLabel(s, DAYS)}</li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
